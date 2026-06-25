@@ -26,21 +26,32 @@ from nse500_swing_alpha import (
     KELLY_FRACTION_MIN,
     PORTFOLIO_HEAT_LIMIT,
     RISK_PER_TRADE,
+    CointegrationAnalyzer,
+    ConceptDriftDetector,
+    CorporateActionsHandler,
     DataQualityMonitor,
+    DrawdownController,
     DynamicAdaptiveEnsemble,
+    ExecutionOptimizer,
     FeatureEngine,
+    MultiFactorRiskModel,
     NSE500AlphaArchitect,
     NSE500DataManager,
+    PerformanceAnalytics,
     PositionReconciler,
     RegimeDetector,
     RegimeState,
     RiskEngine,
+    SectorRotationDetector,
     Signal,
     SignalGenerator,
+    StateManager,
+    StressTestingFramework,
     SystemMonitor,
     TamperEvidentLogger,
     TradeSignal,
     TransactionCost,
+    WalkForwardOptimizer,
 )
 
 # ============================================================================
@@ -1402,3 +1413,730 @@ class TestEdgeCases:
         )
         symbols = dm.load_universe()
         assert symbols == ["RELIANCE.NS", "TCS.NS"]
+
+
+# ============================================================================
+# STATE MANAGER TESTS
+# ============================================================================
+
+
+class TestStateManager:
+    def test_save_and_load(self, tmp_path):
+        sm = StateManager(state_dir=str(tmp_path / "state"))
+        assert sm.save_state("test", {"key": "value", "num": 42})
+        loaded = sm.load_state("test")
+        assert loaded["key"] == "value"
+        assert loaded["num"] == 42
+
+    def test_load_missing(self, tmp_path):
+        sm = StateManager(state_dir=str(tmp_path / "state"))
+        assert sm.load_state("nonexistent") == {}
+
+    def test_delete_state(self, tmp_path):
+        sm = StateManager(state_dir=str(tmp_path / "state"))
+        sm.save_state("todel", {"x": 1})
+        assert sm.delete_state("todel")
+        assert sm.load_state("todel") == {}
+
+    def test_list_states(self, tmp_path):
+        sm = StateManager(state_dir=str(tmp_path / "state"))
+        sm.save_state("alpha", {"a": 1})
+        sm.save_state("beta", {"b": 2})
+        states = sm.list_states()
+        assert "alpha" in states
+        assert "beta" in states
+
+    def test_atomic_overwrite(self, tmp_path):
+        sm = StateManager(state_dir=str(tmp_path / "state"))
+        sm.save_state("x", {"v": 1})
+        sm.save_state("x", {"v": 2})
+        assert sm.load_state("x")["v"] == 2
+
+    def test_datetime_serialization(self, tmp_path):
+        sm = StateManager(state_dir=str(tmp_path / "state"))
+        assert sm.save_state("dt", {"ts": datetime.now()})
+        loaded = sm.load_state("dt")
+        assert "ts" in loaded
+
+
+# ============================================================================
+# STRESS TESTING FRAMEWORK TESTS
+# ============================================================================
+
+
+class TestStressTestingFramework:
+    @pytest.fixture
+    def stress_tester(self):
+        return StressTestingFramework(n_simulations=500, seed=42)
+
+    @pytest.fixture
+    def sample_returns(self):
+        return pd.Series(np.random.default_rng(42).normal(0.001, 0.02, 252))
+
+    def test_monte_carlo_var_positive(self, stress_tester, sample_returns):
+        result = stress_tester.monte_carlo_var(sample_returns, portfolio_value=300_000)
+        assert result["var"] > 0
+        assert result["cvar"] > 0
+        assert result["max_loss"] > 0
+
+    def test_cvar_exceeds_var(self, stress_tester, sample_returns):
+        result = stress_tester.monte_carlo_var(sample_returns)
+        assert result["cvar"] >= result["var"]
+
+    def test_scenario_analysis_count(self, stress_tester, sample_returns):
+        scenarios = stress_tester.scenario_analysis(sample_returns)
+        assert len(scenarios) == 6
+
+    def test_scenario_analysis_keys(self, stress_tester, sample_returns):
+        scenarios = stress_tester.scenario_analysis(sample_returns)
+        for s in scenarios:
+            assert "scenario" in s
+            assert "expected_loss" in s
+            assert "worst_case" in s
+            assert "recovery_probability" in s
+
+    def test_insufficient_data(self, stress_tester):
+        short = pd.Series([0.01, 0.02, -0.01])
+        result = stress_tester.monte_carlo_var(short)
+        assert result["var"] == 0.0
+
+    def test_scenario_insufficient_data(self, stress_tester):
+        short = pd.Series([0.01])
+        assert stress_tester.scenario_analysis(short) == []
+
+    def test_different_confidence_levels(self, stress_tester, sample_returns):
+        var_95 = stress_tester.monte_carlo_var(sample_returns, confidence=0.95)
+        var_99 = stress_tester.monte_carlo_var(sample_returns, confidence=0.99)
+        assert var_99["var"] >= var_95["var"]
+
+
+# ============================================================================
+# WALK-FORWARD OPTIMIZER TESTS
+# ============================================================================
+
+
+class TestWalkForwardOptimizer:
+    def test_generate_splits_basic(self):
+        wfo = WalkForwardOptimizer(
+            train_periods=100, val_periods=30, test_periods=20, step_size=20
+        )
+        splits = wfo.generate_splits(200)
+        assert len(splits) >= 1
+
+    def test_split_structure(self):
+        wfo = WalkForwardOptimizer(
+            train_periods=100, val_periods=30, test_periods=20, step_size=20
+        )
+        splits = wfo.generate_splits(200)
+        for split in splits:
+            assert "train" in split
+            assert "val" in split
+            assert "test" in split
+            train_s, train_e = split["train"]
+            val_s, val_e = split["val"]
+            test_s, test_e = split["test"]
+            assert train_e == val_s
+            assert val_e == test_s
+            assert train_e - train_s == 100
+            assert val_e - val_s == 30
+
+    def test_insufficient_samples(self):
+        wfo = WalkForwardOptimizer(
+            train_periods=100, val_periods=50, test_periods=30
+        )
+        splits = wfo.generate_splits(50)
+        assert len(splits) == 0
+
+    def test_rolling_advance(self):
+        wfo = WalkForwardOptimizer(
+            train_periods=50, val_periods=10, test_periods=10, step_size=10
+        )
+        splits = wfo.generate_splits(100)
+        if len(splits) >= 2:
+            assert splits[1]["train"][0] == splits[0]["train"][0] + 10
+
+
+# ============================================================================
+# CONCEPT DRIFT DETECTOR TESTS
+# ============================================================================
+
+
+class TestConceptDriftDetector:
+    def test_set_baseline(self):
+        dd = ConceptDriftDetector()
+        df = pd.DataFrame({
+            "a": np.random.default_rng(1).normal(0, 1, 100),
+            "b": np.random.default_rng(2).normal(5, 2, 100),
+        })
+        dd.set_baseline(df)
+        assert "a" in dd.baseline_distributions
+        assert "b" in dd.baseline_distributions
+
+    def test_no_drift_similar_data(self):
+        dd = ConceptDriftDetector(threshold=0.5)
+        rng1 = np.random.default_rng(1)
+        rng2 = np.random.default_rng(2)
+        baseline = pd.DataFrame({"a": rng1.normal(0, 1, 200)})
+        dd.set_baseline(baseline)
+        current = pd.DataFrame({"a": rng2.normal(0, 1, 200)})
+        result = dd.detect_drift(current)
+        assert result["drifted"] is False
+
+    def test_drift_shifted_data(self):
+        dd = ConceptDriftDetector(threshold=0.05)
+        baseline = pd.DataFrame({"a": np.random.default_rng(1).normal(0, 1, 200)})
+        dd.set_baseline(baseline)
+        shifted = pd.DataFrame({"a": np.random.default_rng(2).normal(10, 5, 200)})
+        result = dd.detect_drift(shifted)
+        assert result["n_drifted"] > 0
+
+    def test_no_baseline(self):
+        dd = ConceptDriftDetector()
+        result = dd.detect_drift(pd.DataFrame({"a": [1, 2, 3]}))
+        assert result["drifted"] is False
+
+    def test_compute_psi_identical(self):
+        dd = ConceptDriftDetector()
+        dist = np.array([0.1, 0.2, 0.3, 0.2, 0.2])
+        psi = dd.compute_psi(dist, dist)
+        assert abs(psi) < 1e-10
+
+    def test_compute_psi_different(self):
+        dd = ConceptDriftDetector()
+        base = np.array([0.5, 0.3, 0.2])
+        curr = np.array([0.1, 0.3, 0.6])
+        psi = dd.compute_psi(base, curr)
+        assert psi > 0
+
+
+# ============================================================================
+# COINTEGRATION ANALYZER TESTS
+# ============================================================================
+
+
+class TestCointegrationAnalyzer:
+    def test_cointegrated_series(self):
+        ca = CointegrationAnalyzer()
+        rng = np.random.default_rng(42)
+        n = 500
+        x = rng.normal(0, 1, n).cumsum() + 100
+        noise = rng.normal(0, 0.5, n)
+        y = 2 * x + noise + 50
+        result = ca.engle_granger_test(pd.Series(y), pd.Series(x))
+        assert "hedge_ratio" in result
+        assert result["half_life"] >= 0
+
+    def test_non_cointegrated(self):
+        ca = CointegrationAnalyzer()
+        rng = np.random.default_rng(42)
+        a = pd.Series(rng.normal(0, 1, 500).cumsum())
+        b = pd.Series(rng.normal(0, 1, 500).cumsum())
+        result = ca.engle_granger_test(a, b)
+        assert "cointegrated" in result
+
+    def test_short_series(self):
+        ca = CointegrationAnalyzer()
+        a = pd.Series([1, 2, 3])
+        b = pd.Series([4, 5, 6])
+        result = ca.engle_granger_test(a, b)
+        assert result["cointegrated"] is False
+
+    def test_find_pairs(self):
+        ca = CointegrationAnalyzer()
+        rng = np.random.default_rng(42)
+        n = 500
+        base = rng.normal(0, 1, n).cumsum()
+        prices = {
+            "A": pd.Series(base + rng.normal(0, 0.1, n)),
+            "B": pd.Series(2 * base + rng.normal(0, 0.2, n) + 10),
+            "C": pd.Series(rng.normal(0, 1, n).cumsum()),
+        }
+        pairs = ca.find_cointegrated_pairs(prices)
+        assert isinstance(pairs, list)
+
+
+# ============================================================================
+# CORPORATE ACTIONS HANDLER TESTS
+# ============================================================================
+
+
+class TestCorporateActionsHandler:
+    def test_detect_2_to_1_split(self):
+        cah = CorporateActionsHandler()
+        df = pd.DataFrame(
+            {"Close": [1000.0, 1010.0, 500.0, 505.0]},
+            index=pd.date_range("2024-01-01", periods=4, freq="B"),
+        )
+        splits = cah.detect_splits(df)
+        assert len(splits) >= 1
+        assert splits[0]["type"] == "split"
+
+    def test_no_split_normal_price(self):
+        cah = CorporateActionsHandler()
+        df = pd.DataFrame(
+            {"Close": [100.0, 101.0, 102.0, 103.0]},
+            index=pd.date_range("2024-01-01", periods=4, freq="B"),
+        )
+        splits = cah.detect_splits(df)
+        assert len(splits) == 0
+
+    def test_adjust_for_splits(self):
+        cah = CorporateActionsHandler()
+        df = pd.DataFrame(
+            {
+                "Open": [990, 1005, 495, 500],
+                "High": [1020, 1015, 510, 515],
+                "Low": [980, 1000, 490, 498],
+                "Close": [1000, 1010, 500, 505],
+                "Volume": [10000, 12000, 25000, 22000],
+            },
+            index=pd.date_range("2024-01-01", periods=4, freq="B"),
+        )
+        splits = cah.detect_splits(df)
+        adjusted = cah.adjust_for_splits(df, splits)
+        assert len(adjusted) == 4
+
+    def test_empty_dataframe(self):
+        cah = CorporateActionsHandler()
+        assert cah.detect_splits(pd.DataFrame()) == []
+
+    def test_no_splits_returns_original(self):
+        cah = CorporateActionsHandler()
+        df = pd.DataFrame({"Close": [100, 101]}, index=[0, 1])
+        result = cah.adjust_for_splits(df, [])
+        assert result.equals(df)
+
+
+# ============================================================================
+# PERFORMANCE ANALYTICS TESTS
+# ============================================================================
+
+
+class TestPerformanceAnalytics:
+    @pytest.fixture
+    def pa(self):
+        return PerformanceAnalytics()
+
+    @pytest.fixture
+    def sample_returns(self):
+        return pd.Series(
+            np.random.default_rng(42).normal(0.001, 0.015, 252),
+            index=pd.date_range("2024-01-01", periods=252, freq="B"),
+        )
+
+    @pytest.fixture
+    def bench_returns(self):
+        return pd.Series(
+            np.random.default_rng(99).normal(0.0005, 0.012, 252),
+            index=pd.date_range("2024-01-01", periods=252, freq="B"),
+        )
+
+    def test_alpha_beta(self, pa, sample_returns, bench_returns):
+        result = pa.compute_alpha_beta(sample_returns, bench_returns)
+        assert "alpha" in result
+        assert "beta" in result
+        assert "r_squared" in result
+
+    def test_sortino_ratio(self, pa, sample_returns):
+        sortino = pa.sortino_ratio(sample_returns)
+        assert isinstance(sortino, float)
+
+    def test_calmar_ratio(self, pa, sample_returns):
+        calmar = pa.calmar_ratio(sample_returns)
+        assert isinstance(calmar, float)
+
+    def test_information_ratio(self, pa, sample_returns, bench_returns):
+        ir = pa.information_ratio(sample_returns, bench_returns)
+        assert isinstance(ir, float)
+
+    def test_full_attribution(self, pa, sample_returns, bench_returns):
+        result = pa.full_attribution(sample_returns, bench_returns)
+        assert "total_return" in result
+        assert "annualized_return" in result
+        assert "volatility" in result
+        assert "max_drawdown" in result
+        assert "alpha" in result
+        assert "sortino" in result
+
+    def test_full_attribution_no_benchmark(self, pa, sample_returns):
+        result = pa.full_attribution(sample_returns)
+        assert "total_return" in result
+        assert "alpha" not in result
+
+    def test_empty_returns(self, pa):
+        assert pa.full_attribution(pd.Series(dtype=float)) == {}
+
+    def test_short_returns_alpha_beta(self, pa):
+        result = pa.compute_alpha_beta(
+            pd.Series([0.01, 0.02], index=[0, 1]),
+            pd.Series([0.01, 0.02], index=[0, 1]),
+        )
+        assert result["alpha"] == 0.0
+
+
+# ============================================================================
+# DRAWDOWN CONTROLLER TESTS
+# ============================================================================
+
+
+class TestDrawdownController:
+    def test_no_drawdown(self):
+        ddc = DrawdownController()
+        ddc.update_equity(100_000)
+        assert ddc.current_drawdown == 0.0
+        assert not ddc.should_reduce()
+
+    def test_drawdown_below_threshold(self):
+        ddc = DrawdownController(threshold=0.10)
+        ddc.update_equity(100_000)
+        ddc.update_equity(95_000)
+        assert ddc.current_drawdown == 0.05
+        assert not ddc.should_reduce()
+
+    def test_drawdown_above_threshold(self):
+        ddc = DrawdownController(threshold=0.08)
+        ddc.update_equity(100_000)
+        ddc.update_equity(91_000)
+        assert ddc.should_reduce()
+
+    def test_position_reduction(self):
+        ddc = DrawdownController(threshold=0.08, reduce_factor=0.30)
+        ddc.update_equity(100_000)
+        ddc.update_equity(91_000)
+        assert ddc.adjusted_position_size(100) == 70
+
+    def test_no_reduction_when_ok(self):
+        ddc = DrawdownController(threshold=0.08)
+        ddc.update_equity(100_000)
+        ddc.update_equity(95_000)
+        assert ddc.adjusted_position_size(100) == 100
+
+    def test_severe_drawdown_double_reduction(self):
+        ddc = DrawdownController(threshold=0.08, reduce_factor=0.30)
+        ddc.update_equity(100_000)
+        ddc.update_equity(85_000)  # 15% DD > 1.5 * 8%
+        adjusted = ddc.adjusted_position_size(100)
+        assert adjusted < 70  # should reduce more than 30%
+
+    def test_peak_equity_tracking(self):
+        ddc = DrawdownController()
+        ddc.update_equity(100_000)
+        ddc.update_equity(110_000)
+        ddc.update_equity(105_000)
+        assert ddc.peak_equity == 110_000
+        assert ddc.current_equity == 105_000
+
+    def test_minimum_position(self):
+        ddc = DrawdownController(threshold=0.01, reduce_factor=0.99)
+        ddc.update_equity(100_000)
+        ddc.update_equity(98_000)
+        assert ddc.adjusted_position_size(1) >= 1
+
+
+# ============================================================================
+# MULTI-FACTOR RISK MODEL TESTS
+# ============================================================================
+
+
+class TestMultiFactorRiskModel:
+    def test_compute_market_beta(self):
+        mfr = MultiFactorRiskModel()
+        rng = np.random.default_rng(42)
+        idx = pd.date_range("2024-01-01", periods=200, freq="B")
+        market = pd.Series(rng.normal(0.001, 0.01, 200), index=idx)
+        stock = pd.Series(1.5 * market.values + rng.normal(0, 0.005, 200), index=idx)
+        exposures = mfr.compute_factor_exposures(stock, market)
+        assert "market_beta" in exposures
+        assert abs(exposures["market_beta"] - 1.5) < 0.5
+
+    def test_short_series(self):
+        mfr = MultiFactorRiskModel()
+        result = mfr.compute_factor_exposures(
+            pd.Series([0.01, 0.02], index=[0, 1]),
+            pd.Series([0.01, 0.02], index=[0, 1]),
+        )
+        assert result == {"market_beta": 0.0}
+
+    def test_risk_contribution(self):
+        mfr = MultiFactorRiskModel()
+        weights = np.array([0.5, 0.5])
+        cov = np.array([[0.04, 0.01], [0.01, 0.03]])
+        rc = mfr.risk_contribution(weights, cov)
+        assert len(rc) == 2
+        assert all(np.isfinite(rc))
+
+    def test_hrp_weights(self):
+        mfr = MultiFactorRiskModel()
+        cov = np.array([[0.04, 0.01], [0.01, 0.09]])
+        weights = mfr.hierarchical_risk_parity(cov, 2)
+        assert len(weights) == 2
+        assert abs(weights.sum() - 1.0) < 1e-10
+        assert weights[0] > weights[1]  # lower variance gets higher weight
+
+    def test_zero_variance_hrp(self):
+        mfr = MultiFactorRiskModel()
+        cov = np.diag([0.0, 0.04])
+        weights = mfr.hierarchical_risk_parity(cov, 2)
+        assert all(np.isfinite(weights))
+
+
+# ============================================================================
+# SECTOR ROTATION DETECTOR TESTS
+# ============================================================================
+
+
+class TestSectorRotationDetector:
+    def test_bullish_rotation(self):
+        srd = SectorRotationDetector(threshold=0.70)
+        signals = {"IT": ["BUY", "BUY", "BUY", "HOLD"]}
+        result = srd.detect_rotation(signals)
+        assert "IT" in result
+        assert result["IT"]["direction"] == "BULLISH"
+
+    def test_bearish_rotation(self):
+        srd = SectorRotationDetector(threshold=0.70)
+        signals = {"Banks": ["SELL", "SELL", "SELL", "HOLD"]}
+        result = srd.detect_rotation(signals)
+        assert "Banks" in result
+        assert result["Banks"]["direction"] == "BEARISH"
+
+    def test_no_rotation(self):
+        srd = SectorRotationDetector(threshold=0.70)
+        signals = {"Mixed": ["BUY", "SELL", "HOLD", "BUY"]}
+        result = srd.detect_rotation(signals)
+        assert "Mixed" not in result
+
+    def test_empty_signals(self):
+        srd = SectorRotationDetector()
+        assert srd.detect_rotation({}) == {}
+
+    def test_multiple_sectors(self):
+        srd = SectorRotationDetector(threshold=0.60)
+        signals = {
+            "IT": ["BUY", "BUY", "BUY"],
+            "Pharma": ["SELL", "SELL", "SELL"],
+            "Auto": ["BUY", "HOLD", "SELL"],
+        }
+        result = srd.detect_rotation(signals)
+        assert "IT" in result
+        assert "Pharma" in result
+        assert "Auto" not in result
+
+
+# ============================================================================
+# EXECUTION OPTIMIZER TESTS
+# ============================================================================
+
+
+class TestExecutionOptimizer:
+    @pytest.fixture
+    def exec_opt(self):
+        return ExecutionOptimizer()
+
+    def test_almgren_chriss_impact(self, exec_opt):
+        result = exec_opt.almgren_chriss_impact(1000, 500_000, 0.02)
+        assert result["total_cost_bps"] > 0
+        assert result["temporary_impact"] > 0
+        assert result["permanent_impact"] > 0
+
+    def test_zero_volume_impact(self, exec_opt):
+        result = exec_opt.almgren_chriss_impact(1000, 0, 0.02)
+        assert result["total_cost_bps"] == 0.0
+
+    def test_execution_schedule(self, exec_opt):
+        schedule = exec_opt.optimal_execution_schedule(50_000, 200_000)
+        assert len(schedule) > 0
+        total = sum(s["quantity"] for s in schedule)
+        assert total == 50_000
+
+    def test_small_order_single_day(self, exec_opt):
+        schedule = exec_opt.optimal_execution_schedule(1000, 1_000_000)
+        assert len(schedule) == 1
+        assert schedule[0]["quantity"] == 1000
+
+    def test_large_order_multi_day(self, exec_opt):
+        schedule = exec_opt.optimal_execution_schedule(100_000, 200_000, n_days=5)
+        assert len(schedule) >= 2
+
+    def test_empty_schedule(self, exec_opt):
+        assert exec_opt.optimal_execution_schedule(0, 100_000) == []
+
+    def test_time_stop_no_trigger(self, exec_opt):
+        entry = datetime(2024, 1, 1)
+        current = datetime(2024, 1, 10)
+        assert not exec_opt.time_stop_check(entry, current, 100.0, 105.0)
+
+    def test_time_stop_trigger(self, exec_opt):
+        entry = datetime(2024, 1, 1)
+        current = datetime(2024, 1, 20)
+        assert exec_opt.time_stop_check(entry, current, 100.0, 100.5)
+
+    def test_time_stop_moved_enough(self, exec_opt):
+        entry = datetime(2024, 1, 1)
+        current = datetime(2024, 1, 20)
+        assert not exec_opt.time_stop_check(entry, current, 100.0, 110.0)
+
+
+# ============================================================================
+# EXPANDED FEATURE ENGINE TESTS
+# ============================================================================
+
+
+class TestExpandedFeatureEngine:
+    @pytest.fixture
+    def feature_engine(self):
+        return FeatureEngine()
+
+    @pytest.fixture
+    def price_data(self):
+        rng = np.random.default_rng(42)
+        n = 300
+        c = 100 + rng.normal(0, 1.2, n).cumsum()
+        df = pd.DataFrame({
+            "Open": c + rng.normal(0, 0.5, n),
+            "High": c + abs(rng.normal(0, 1, n)) + 1,
+            "Low": c - abs(rng.normal(0, 1, n)) - 1,
+            "Close": c,
+            "Volume": rng.integers(10000, 100000, n).astype(float),
+        }, index=pd.date_range("2023-01-01", periods=n, freq="B"))
+        return df
+
+    def test_hull_moving_average(self, feature_engine, price_data):
+        result = feature_engine.hull_moving_average(price_data["Close"], 9)
+        assert len(result) == len(price_data)
+        assert result.dropna().shape[0] > 0
+
+    def test_aroon(self, feature_engine, price_data):
+        up, down = feature_engine.aroon(price_data["High"], price_data["Low"])
+        assert len(up) == len(price_data)
+        assert len(down) == len(price_data)
+
+    def test_elder_ray(self, feature_engine, price_data):
+        bull, bear = feature_engine.elder_ray(
+            price_data["High"], price_data["Low"], price_data["Close"]
+        )
+        assert len(bull) == len(price_data)
+
+    def test_supertrend(self, feature_engine, price_data):
+        result = feature_engine.supertrend(
+            price_data["High"], price_data["Low"], price_data["Close"]
+        )
+        assert len(result) == len(price_data)
+
+    def test_choppiness_index(self, feature_engine, price_data):
+        result = feature_engine.choppiness_index(
+            price_data["High"], price_data["Low"], price_data["Close"]
+        )
+        assert len(result) == len(price_data)
+
+    def test_vortex_indicator(self, feature_engine, price_data):
+        vi_plus, vi_minus = feature_engine.vortex_indicator(
+            price_data["High"], price_data["Low"], price_data["Close"]
+        )
+        assert len(vi_plus) == len(price_data)
+
+    def test_mass_index(self, feature_engine, price_data):
+        result = feature_engine.mass_index(price_data["High"], price_data["Low"])
+        assert len(result) == len(price_data)
+
+    def test_corwin_schultz_spread(self, feature_engine, price_data):
+        result = feature_engine.corwin_schultz_spread(
+            price_data["High"], price_data["Low"]
+        )
+        assert len(result) == len(price_data)
+        clean = result.dropna()
+        assert (clean >= 0).all()
+
+    def test_lempel_ziv_complexity(self, feature_engine, price_data):
+        result = feature_engine.lempel_ziv_complexity(price_data["Close"])
+        assert len(result) == len(price_data)
+
+    def test_order_flow_imbalance(self, feature_engine, price_data):
+        result = feature_engine.order_flow_imbalance(
+            price_data["Open"], price_data["High"],
+            price_data["Low"], price_data["Close"],
+        )
+        assert len(result) == len(price_data)
+
+    def test_darvas_box(self, feature_engine, price_data):
+        result = feature_engine.darvas_box(price_data["High"], price_data["Low"])
+        assert "box_top" in result
+        assert "breakout_up" in result
+
+    def test_linear_regression_features(self, feature_engine, price_data):
+        result = feature_engine.linear_regression_features(price_data["Close"])
+        assert "slope" in result
+        assert "r_squared" in result
+        assert "deviation" in result
+
+    def test_efficiency_ratio(self, feature_engine, price_data):
+        result = feature_engine.efficiency_ratio(price_data["Close"])
+        assert len(result) == len(price_data)
+
+    def test_disparity_index(self, feature_engine, price_data):
+        result = feature_engine.disparity_index(price_data["Close"], 14)
+        assert len(result) == len(price_data)
+
+    def test_coppock_curve(self, feature_engine, price_data):
+        result = feature_engine.coppock_curve(price_data["Close"])
+        assert len(result) == len(price_data)
+
+    def test_compute_all_features_expanded(self, feature_engine, price_data):
+        result = feature_engine.compute_all_features(price_data)
+        assert len(result.columns) >= 150
+        for col in ["hma_9", "aroon_up", "supertrend", "choppiness_14",
+                     "mass_index", "lr_slope_20", "pmo", "darvas_breakout_up",
+                     "order_flow_imbalance", "natr_14"]:
+            assert col in result.columns, f"Missing feature: {col}"
+
+    def test_lz_complexity_static(self):
+        assert FeatureEngine._lz_complexity("") == 0
+        assert FeatureEngine._lz_complexity("1111") >= 1
+        assert FeatureEngine._lz_complexity("0101010101") >= 2
+
+    def test_chaikin_volatility(self, feature_engine, price_data):
+        result = feature_engine.chaikin_volatility(
+            price_data["High"], price_data["Low"]
+        )
+        assert len(result) == len(price_data)
+
+    def test_price_momentum_oscillator(self, feature_engine, price_data):
+        result = feature_engine.price_momentum_oscillator(price_data["Close"])
+        assert len(result) == len(price_data)
+
+    def test_trend_intensity_index(self, feature_engine, price_data):
+        result = feature_engine.trend_intensity_index(price_data["Close"])
+        assert len(result) == len(price_data)
+
+
+# ============================================================================
+# INTEGRATION TEST: FULL PIPELINE WITH NEW COMPONENTS
+# ============================================================================
+
+
+class TestIntegrationNewComponents:
+    def test_orchestrator_has_new_components(self):
+        arch = NSE500AlphaArchitect(capital=100_000, state_dir="./test_int_state")
+        assert hasattr(arch, "state_manager")
+        assert hasattr(arch, "stress_tester")
+        assert hasattr(arch, "walk_forward")
+        assert hasattr(arch, "drift_detector")
+        assert hasattr(arch, "cointegration")
+        assert hasattr(arch, "corp_actions")
+        assert hasattr(arch, "perf_analytics")
+        assert hasattr(arch, "dd_controller")
+        assert hasattr(arch, "factor_model")
+        assert hasattr(arch, "sector_rotation")
+        assert hasattr(arch, "exec_optimizer")
+        import shutil
+        shutil.rmtree("./test_int_state", ignore_errors=True)
+
+    def test_pipeline_includes_drift_stress(self):
+        arch = NSE500AlphaArchitect(capital=100_000, state_dir="./test_pipe_state")
+        summary = arch.run_full_pipeline()
+        assert "drift_detection" in summary
+        assert "stress_test" in summary
+        assert "drawdown" in summary
+        import shutil
+        shutil.rmtree("./test_pipe_state", ignore_errors=True)
+        shutil.rmtree("./state", ignore_errors=True)

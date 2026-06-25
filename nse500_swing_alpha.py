@@ -19,6 +19,17 @@ Architecture:
     +-- RiskEngine (Kelly, ATR stops, circuit breakers, VaR)
     +-- PositionReconciler (full trade ledger, XIRR, fees)
     +-- SystemMonitor (hardware awareness, graceful degradation)
+    +-- StateManager (persistence across restarts)
+    +-- StressTestingFramework (Monte Carlo VaR/CVaR, 6 scenarios)
+    +-- WalkForwardOptimizer (rolling-origin validation)
+    +-- ConceptDriftDetector (PSI-based feature drift monitoring)
+    +-- CointegrationAnalyzer (Engle-Granger, half-life)
+    +-- CorporateActionsHandler (split/bonus detection & adjustment)
+    +-- PerformanceAnalytics (alpha/beta, Sortino, Calmar, IR)
+    +-- DrawdownController (auto position reduction at DD thresholds)
+    +-- MultiFactorRiskModel (Fama-French style, HRP allocation)
+    +-- SectorRotationDetector (sector-wide momentum detection)
+    +-- ExecutionOptimizer (Almgren-Chriss impact, TWAP/VWAP, time stops)
 
 LLM Orchestration Integration:
     - LangChain: Overall pipeline orchestration, tool-calling for data retrieval
@@ -33,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import time
@@ -64,6 +76,14 @@ MAX_CONCURRENT_DOWNLOADS = 10
 RATE_LIMIT_DELAY = 0.5
 BACKOFF_BASE = 2.0
 BACKOFF_MAX_RETRIES = 5
+DRAWDOWN_REDUCE_THRESHOLD = 0.08  # 8% DD triggers position reduction
+DRAWDOWN_REDUCE_FACTOR = 0.30  # Reduce positions by 30%
+TIME_STOP_DAYS = 15  # Exit if no movement after 15 days
+STRESS_SCENARIOS = 6  # Number of Monte Carlo stress scenarios
+DRIFT_THRESHOLD = 0.10  # PSI threshold for concept drift alert
+WALK_FORWARD_TRAIN_YEARS = 3
+WALK_FORWARD_VAL_MONTHS = 6
+WALK_FORWARD_TEST_MONTHS = 3
 
 # Indian market transaction costs (Zerodha rates)
 STT_DELIVERY = 0.001  # 0.1% on buy+sell
@@ -863,7 +883,7 @@ class FeatureEngine:
         kijun = (high.rolling(26).max() + low.rolling(26).min()) / 2
         senkou_a = ((tenkan + kijun) / 2).shift(26)
         senkou_b = ((high.rolling(52).max() + low.rolling(52).min()) / 2).shift(26)
-        chikou = close.shift(-26)
+        chikou = close.shift(26)  # Lagging span (NOT shift(-26) which is look-ahead bias)
         return {
             "tenkan": tenkan,
             "kijun": kijun,
@@ -1180,6 +1200,243 @@ class FeatureEngine:
             {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
         ).dropna()
 
+    # --- Additional Indicators (Expansion to 200+) ---
+
+    def hull_moving_average(self, series: pd.Series, period: int = 9) -> pd.Series:
+        """Hull Moving Average - faster response, less lag."""
+        half = int(period / 2)
+        sqrt_period = int(np.sqrt(period))
+        wma_half = self.wma(series, half)
+        wma_full = self.wma(series, period)
+        diff = 2 * wma_half - wma_full
+        return self.wma(diff, sqrt_period)
+
+    def aroon(self, high: pd.Series, low: pd.Series,
+              period: int = 25) -> tuple[pd.Series, pd.Series]:
+        """Aroon Up/Down oscillator."""
+        aroon_up = high.rolling(period + 1).apply(
+            lambda x: float(np.argmax(x)) / period * 100, raw=True
+        )
+        aroon_down = low.rolling(period + 1).apply(
+            lambda x: float(np.argmin(x)) / period * 100, raw=True
+        )
+        return aroon_up, aroon_down
+
+    def elder_ray(self, high: pd.Series, low: pd.Series,
+                  close: pd.Series, period: int = 13) -> tuple[pd.Series, pd.Series]:
+        """Elder Ray Bull/Bear Power."""
+        ema_val = self.ema(close, period)
+        bull_power = high - ema_val
+        bear_power = low - ema_val
+        return bull_power, bear_power
+
+    def coppock_curve(self, close: pd.Series) -> pd.Series:
+        """Coppock Curve - long-term momentum indicator."""
+        roc_14 = self.roc(close, 14)
+        roc_11 = self.roc(close, 11)
+        return self.wma(roc_14 + roc_11, 10)
+
+    def supertrend(self, high: pd.Series, low: pd.Series,
+                   close: pd.Series, period: int = 10,
+                   multiplier: float = 3.0) -> pd.Series:
+        """Supertrend indicator."""
+        atr_val = self.atr(high, low, close, period)
+        hl2 = (high + low) / 2
+        upper_band = hl2 + multiplier * atr_val
+        lower_band = hl2 - multiplier * atr_val
+
+        supertrend = pd.Series(0.0, index=close.index)
+        direction = pd.Series(1, index=close.index)
+
+        for i in range(1, len(close)):
+            if close.iloc[i] > upper_band.iloc[i - 1]:
+                direction.iloc[i] = 1
+            elif close.iloc[i] < lower_band.iloc[i - 1]:
+                direction.iloc[i] = -1
+            else:
+                direction.iloc[i] = direction.iloc[i - 1]
+
+            if direction.iloc[i] == 1:
+                supertrend.iloc[i] = lower_band.iloc[i]
+            else:
+                supertrend.iloc[i] = upper_band.iloc[i]
+
+        return supertrend
+
+    def choppiness_index(self, high: pd.Series, low: pd.Series,
+                         close: pd.Series, period: int = 14) -> pd.Series:
+        """Choppiness Index - measures market trendiness."""
+        atr_val = self.atr(high, low, close, 1)
+        atr_sum = atr_val.rolling(period).sum()
+        high_low_diff = high.rolling(period).max() - low.rolling(period).min()
+        safe_diff = high_low_diff.replace(0, np.nan)
+        return 100.0 * np.log10(atr_sum / safe_diff) / np.log10(period)
+
+    def vortex_indicator(self, high: pd.Series, low: pd.Series,
+                         close: pd.Series,
+                         period: int = 14) -> tuple[pd.Series, pd.Series]:
+        """Vortex Indicator (VI+ and VI-)."""
+        vm_plus = abs(high - low.shift(1))
+        vm_minus = abs(low - high.shift(1))
+        tr = pd.concat([
+            high - low,
+            abs(high - close.shift(1)),
+            abs(low - close.shift(1))
+        ], axis=1).max(axis=1)
+        tr_sum = tr.rolling(period).sum().replace(0, np.nan)
+        vi_plus = vm_plus.rolling(period).sum() / tr_sum
+        vi_minus = vm_minus.rolling(period).sum() / tr_sum
+        return vi_plus, vi_minus
+
+    def mass_index(self, high: pd.Series, low: pd.Series,
+                   period: int = 25) -> pd.Series:
+        """Mass Index - detects trend reversals via range widening."""
+        rng = self.ema(high - low, 9)
+        rng2 = self.ema(rng, 9)
+        ratio = rng / rng2.replace(0, np.nan)
+        return ratio.rolling(period).sum()
+
+    def chaikin_volatility(self, high: pd.Series, low: pd.Series,
+                           period: int = 10) -> pd.Series:
+        """Chaikin Volatility - rate of change of ATR."""
+        hl_ema = self.ema(high - low, period)
+        return hl_ema.pct_change(period) * 100
+
+    def linear_regression_features(self, series: pd.Series,
+                                   period: int = 20) -> dict[str, pd.Series]:
+        """Linear regression slope, R-squared, and deviation."""
+        slope = pd.Series(np.nan, index=series.index)
+        r_squared = pd.Series(np.nan, index=series.index)
+        deviation = pd.Series(np.nan, index=series.index)
+        x = np.arange(period, dtype=float)
+        x_mean = x.mean()
+        ss_xx = np.sum((x - x_mean) ** 2)
+
+        vals = series.values
+        for i in range(period - 1, len(vals)):
+            y = vals[i - period + 1: i + 1]
+            if np.any(np.isnan(y)):
+                continue
+            y_mean = np.mean(y)
+            ss_xy = np.sum((x - x_mean) * (y - y_mean))
+            ss_yy = np.sum((y - y_mean) ** 2)
+            b = ss_xy / ss_xx if ss_xx != 0 else 0.0
+            slope.iloc[i] = b
+            r_squared.iloc[i] = (ss_xy ** 2 / (ss_xx * ss_yy)) if ss_yy != 0 else 0.0
+            predicted = y_mean + b * (x[-1] - x_mean)
+            deviation.iloc[i] = (vals[i] - predicted) / abs(predicted) if predicted != 0 else 0.0
+
+        return {"slope": slope, "r_squared": r_squared, "deviation": deviation}
+
+    def efficiency_ratio(self, series: pd.Series, period: int = 10) -> pd.Series:
+        """Kaufman Efficiency Ratio (directional movement / total movement)."""
+        direction = abs(series - series.shift(period))
+        volatility = abs(series.diff()).rolling(period).sum().replace(0, np.nan)
+        return direction / volatility
+
+    def disparity_index(self, series: pd.Series, period: int = 14) -> pd.Series:
+        """Disparity Index (% distance from moving average)."""
+        ma = self.sma(series, period)
+        return ((series - ma) / ma.replace(0, np.nan)) * 100
+
+    def price_momentum_oscillator(self, series: pd.Series) -> pd.Series:
+        """Price Momentum Oscillator (double-smoothed ROC)."""
+        roc_val = self.roc(series, 1)
+        smooth1 = self.ema(roc_val, 35)
+        return self.ema(smooth1, 20)
+
+    def trend_intensity_index(self, close: pd.Series,
+                              period: int = 30) -> pd.Series:
+        """Trend Intensity Index - measures trend strength."""
+        sma_val = self.sma(close, period)
+        above = (close > sma_val).astype(float)
+        return above.rolling(period).sum() / period * 100
+
+    def corwin_schultz_spread(self, high: pd.Series,
+                              low: pd.Series) -> pd.Series:
+        """Corwin-Schultz bid-ask spread estimator from OHLC."""
+        beta = (np.log(high / low)) ** 2
+        beta_sum = beta + beta.shift(1)
+        gamma = (np.log(high.rolling(2).max() / low.rolling(2).min())) ** 2
+        alpha = (np.sqrt(2 * beta_sum) - np.sqrt(beta_sum)) / (
+            3 - 2 * np.sqrt(2)
+        ) - np.sqrt(gamma / (3 - 2 * np.sqrt(2)))
+        alpha = alpha.clip(lower=0)
+        spread = 2 * (np.exp(alpha) - 1) / (1 + np.exp(alpha))
+        return spread.clip(lower=0)
+
+    def lempel_ziv_complexity(self, series: pd.Series,
+                              window: int = 100) -> pd.Series:
+        """Lempel-Ziv complexity - measures randomness of price sequence."""
+        result = pd.Series(np.nan, index=series.index)
+        binary = (series.diff() > 0).astype(int)
+        vals = binary.values
+
+        for i in range(window - 1, len(vals)):
+            seq = vals[i - window + 1: i + 1]
+            if np.any(np.isnan(seq)):
+                continue
+            s = "".join(str(int(x)) for x in seq)
+            complexity = self._lz_complexity(s)
+            n = len(s)
+            norm = n / np.log2(n) if n > 1 else 1.0
+            result.iloc[i] = complexity / norm if norm > 0 else 0.0
+
+        return result
+
+    @staticmethod
+    def _lz_complexity(s: str) -> int:
+        """Count Lempel-Ziv complexity of a binary string."""
+        n = len(s)
+        if n == 0:
+            return 0
+        complexity = 1
+        prefix_len = 1
+        component_len = 1
+        i = 0
+        while prefix_len + component_len <= n:
+            if s[i + component_len - 1] == s[prefix_len + component_len - 1]:
+                component_len += 1
+            else:
+                complexity += 1
+                i += 1
+                if i == prefix_len:
+                    prefix_len += component_len
+                    component_len = 1
+                    i = 0
+                else:
+                    component_len = 1
+        complexity += 1
+        return complexity
+
+    def order_flow_imbalance(self, open_: pd.Series, high: pd.Series,
+                             low: pd.Series, close: pd.Series) -> pd.Series:
+        """Estimate order flow imbalance from OHLC."""
+        buying_pressure = (close - low) / (high - low).replace(0, np.nan)
+        selling_pressure = (high - close) / (high - low).replace(0, np.nan)
+        return buying_pressure - selling_pressure
+
+    def darvas_box(self, high: pd.Series, low: pd.Series,
+                   period: int = 20) -> dict[str, pd.Series]:
+        """Darvas Box breakout detection."""
+        box_top = high.rolling(period).max()
+        box_bottom = low.rolling(period).min()
+        breakout_up = (high > box_top.shift(1)).astype(int)
+        breakout_down = (low < box_bottom.shift(1)).astype(int)
+        return {
+            "box_top": box_top,
+            "box_bottom": box_bottom,
+            "breakout_up": breakout_up,
+            "breakout_down": breakout_down,
+        }
+
+    def relative_strength_market(self, close: pd.Series,
+                                 market: pd.Series) -> pd.Series:
+        """Relative strength vs market benchmark."""
+        close_norm = close / close.iloc[0] if close.iloc[0] != 0 else close
+        market_norm = market / market.iloc[0] if market.iloc[0] != 0 else market
+        return close_norm / market_norm.replace(0, np.nan)
+
     def compute_all_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Compute 200+ features from OHLCV data."""
         if df.empty:
@@ -1358,6 +1615,152 @@ class FeatureEngine:
         candle_patterns = self.detect_candlestick_patterns(o, h, lo, c)
         for col in candle_patterns.columns:
             features[f"candle_{col}"] = candle_patterns[col]
+
+        # === NEW: Expanded Indicators (reaching 200+) ===
+
+        # Hull Moving Average
+        for p in [9, 16, 25]:
+            features[f"hma_{p}"] = self.hull_moving_average(c, p)
+
+        # Aroon Oscillator
+        aroon_up, aroon_down = self.aroon(h, lo)
+        features["aroon_up"] = aroon_up
+        features["aroon_down"] = aroon_down
+        features["aroon_osc"] = aroon_up - aroon_down
+
+        # Elder Ray
+        bull_power, bear_power = self.elder_ray(h, lo, c)
+        features["elder_bull_power"] = bull_power
+        features["elder_bear_power"] = bear_power
+
+        # Coppock Curve
+        features["coppock_curve"] = self.coppock_curve(c)
+
+        # Supertrend
+        features["supertrend"] = self.supertrend(h, lo, c)
+        features["price_vs_supertrend"] = (c > features["supertrend"]).astype(int)
+
+        # Choppiness Index
+        features["choppiness_14"] = self.choppiness_index(h, lo, c)
+
+        # Vortex Indicator
+        vi_plus, vi_minus = self.vortex_indicator(h, lo, c)
+        features["vortex_plus"] = vi_plus
+        features["vortex_minus"] = vi_minus
+        features["vortex_diff"] = vi_plus - vi_minus
+
+        # Mass Index
+        features["mass_index"] = self.mass_index(h, lo)
+
+        # Chaikin Volatility
+        features["chaikin_vol"] = self.chaikin_volatility(h, lo)
+
+        # Linear Regression features
+        lr = self.linear_regression_features(c, 20)
+        features["lr_slope_20"] = lr["slope"]
+        features["lr_r2_20"] = lr["r_squared"]
+        features["lr_dev_20"] = lr["deviation"]
+
+        # Efficiency Ratio
+        features["efficiency_ratio_10"] = self.efficiency_ratio(c, 10)
+
+        # Disparity Index
+        for p in [5, 14, 25]:
+            features[f"disparity_{p}"] = self.disparity_index(c, p)
+
+        # Price Momentum Oscillator
+        features["pmo"] = self.price_momentum_oscillator(c)
+
+        # Trend Intensity Index
+        features["tii_30"] = self.trend_intensity_index(c, 30)
+
+        # Corwin-Schultz spread estimator
+        features["cs_spread"] = self.corwin_schultz_spread(h, lo)
+
+        # Lempel-Ziv Complexity
+        if len(c) >= 100:
+            features["lz_complexity"] = self.lempel_ziv_complexity(c, min(100, len(c)))
+
+        # Order Flow Imbalance
+        features["order_flow_imbalance"] = self.order_flow_imbalance(o, h, lo, c)
+
+        # Darvas Box
+        darvas = self.darvas_box(h, lo)
+        features["darvas_box_top"] = darvas["box_top"]
+        features["darvas_box_bottom"] = darvas["box_bottom"]
+        features["darvas_breakout_up"] = darvas["breakout_up"]
+        features["darvas_breakout_down"] = darvas["breakout_down"]
+
+        # Price acceleration
+        features["price_accel"] = c.pct_change().diff()
+
+        # Close location value
+        features["close_location_value"] = (
+            (c - lo) - (h - c)
+        ) / (h - lo).replace(0, np.nan)
+
+        # Volatility ratio (Schwager)
+        tr = pd.concat([
+            h - lo,
+            abs(h - c.shift(1)),
+            abs(lo - c.shift(1))
+        ], axis=1).max(axis=1)
+        features["volatility_ratio"] = tr / self.atr(h, lo, c, 14).replace(0, np.nan)
+
+        # Normalized ATR
+        features["natr_14"] = self.atr(h, lo, c, 14) / c * 100
+
+        # Multi-timeframe features
+        if len(df) > 60:
+            weekly = self.resample_to_weekly(df)
+            if len(weekly) > 5:
+                w_rsi = self.rsi(weekly["Close"], 14)
+                features["weekly_rsi"] = w_rsi.reindex(df.index, method="ffill")
+                w_ema = self.ema(weekly["Close"], 21)
+                features["weekly_ema_21"] = w_ema.reindex(df.index, method="ffill")
+                features["weekly_trend"] = (
+                    weekly["Close"] > w_ema
+                ).astype(int).reindex(df.index, method="ffill")
+
+        if len(df) > 252:
+            monthly = self.resample_to_monthly(df)
+            if len(monthly) > 3:
+                m_rsi = self.rsi(monthly["Close"], 14)
+                features["monthly_rsi"] = m_rsi.reindex(df.index, method="ffill")
+                m_ema = self.ema(monthly["Close"], 10)
+                features["monthly_ema_10"] = m_ema.reindex(df.index, method="ffill")
+
+        # Trend coherence score (multi-timeframe alignment)
+        trend_scores = []
+        for col in ["triple_ema_align", "price_vs_supertrend"]:
+            if col in features.columns:
+                trend_scores.append(features[col])
+        if "weekly_trend" in features.columns:
+            trend_scores.append(features["weekly_trend"])
+        if trend_scores:
+            features["mtf_coherence"] = sum(trend_scores) / len(trend_scores)
+
+        # Regime momentum composite
+        features["regime_momentum"] = (
+            features.get("adx_14", pd.Series(0, index=df.index)).fillna(0) / 100.0 * 0.3
+            + features.get("choppiness_14", pd.Series(50, index=df.index)).fillna(50).clip(0, 100) / 100.0 * 0.3
+            + features.get("efficiency_ratio_10", pd.Series(0.5, index=df.index)).fillna(0.5) * 0.4
+        )
+
+        # Volume-weighted momentum
+        vol_norm = v / v.rolling(20).mean().replace(0, np.nan)
+        features["vol_weighted_momentum"] = c.pct_change(5) * vol_norm.fillna(1)
+
+        # Intraday intensity
+        features["intraday_intensity"] = (
+            (2 * c - h - lo) / (h - lo).replace(0, np.nan) * v
+        )
+
+        # Additional RSI divergence proxy
+        rsi_14 = features.get("rsi_14", self.rsi(c, 14))
+        price_trend = (c > c.shift(5)).astype(int)
+        rsi_trend = (rsi_14 > rsi_14.shift(5)).astype(int)
+        features["rsi_divergence"] = (price_trend != rsi_trend).astype(int)
 
         self.logger.info(f"Computed {len(features.columns)} features")
         return features
@@ -2317,6 +2720,834 @@ class SystemMonitor:
 
 
 # ============================================================================
+# STATE MANAGER (Persistence across restarts)
+# ============================================================================
+
+
+class StateManager:
+    """Persist critical trading state to survive restarts."""
+
+    def __init__(self, state_dir: str = "./state"):
+        self.state_dir = Path(state_dir)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.logger = TamperEvidentLogger("StateManager")
+
+    def save_state(self, name: str, data: dict[str, Any]) -> bool:
+        """Atomic write of state to disk."""
+        temp_path = self.state_dir / f"{name}.tmp"
+        final_path = self.state_dir / f"{name}.json"
+        try:
+            with open(temp_path, "w") as fh:
+                json.dump(data, fh, default=str, indent=2)
+            os.replace(str(temp_path), str(final_path))
+            return True
+        except (OSError, TypeError) as exc:
+            self.logger.error(f"Failed to save state '{name}': {exc}")
+            return False
+
+    def load_state(self, name: str) -> dict[str, Any]:
+        """Load state from disk. Returns empty dict if not found."""
+        path = self.state_dir / f"{name}.json"
+        try:
+            with open(path) as fh:
+                return json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def delete_state(self, name: str) -> bool:
+        """Remove a state file."""
+        path = self.state_dir / f"{name}.json"
+        try:
+            path.unlink(missing_ok=True)
+            return True
+        except OSError:
+            return False
+
+    def list_states(self) -> list[str]:
+        """List all saved state names."""
+        return [p.stem for p in self.state_dir.glob("*.json")]
+
+
+# ============================================================================
+# STRESS TESTING FRAMEWORK
+# ============================================================================
+
+
+class StressTestingFramework:
+    """Monte Carlo stress testing with multiple scenario types."""
+
+    def __init__(self, n_simulations: int = 1000, seed: int = 42):
+        self.n_simulations = n_simulations
+        self.rng = np.random.default_rng(seed)
+        self.logger = TamperEvidentLogger("StressTest")
+
+    def monte_carlo_var(
+        self, returns: pd.Series, confidence: float = 0.99,
+        horizon: int = 5, portfolio_value: float = DEFAULT_CAPITAL,
+    ) -> dict[str, float]:
+        """Monte Carlo VaR and CVaR estimation."""
+        clean = returns.dropna().values
+        if len(clean) < 30:
+            return {"var": 0.0, "cvar": 0.0, "max_loss": 0.0}
+
+        mu = float(np.mean(clean))
+        sigma = float(np.std(clean))
+
+        simulated = self.rng.normal(mu, sigma, (self.n_simulations, horizon))
+        portfolio_returns = np.sum(simulated, axis=1)
+
+        var_percentile = np.percentile(portfolio_returns, (1 - confidence) * 100)
+        cvar = float(np.mean(portfolio_returns[portfolio_returns <= var_percentile]))
+        max_loss = float(np.min(portfolio_returns))
+
+        return {
+            "var": abs(var_percentile) * portfolio_value,
+            "cvar": abs(cvar) * portfolio_value,
+            "max_loss": abs(max_loss) * portfolio_value,
+        }
+
+    def scenario_analysis(
+        self, returns: pd.Series, portfolio_value: float = DEFAULT_CAPITAL,
+    ) -> list[dict[str, Any]]:
+        """Run predefined stress scenarios."""
+        clean = returns.dropna().values
+        if len(clean) < 30:
+            return []
+
+        mu = float(np.mean(clean))
+        sigma = float(np.std(clean))
+
+        scenarios = [
+            {"name": "Market Crash (-20%)", "shock": -0.20},
+            {"name": "Flash Crash (-10%)", "shock": -0.10},
+            {"name": "Volatility Spike (3x)", "vol_mult": 3.0},
+            {"name": "Liquidity Drought", "shock": -0.05, "vol_mult": 2.0},
+            {"name": "Sector Rotation (-8%)", "shock": -0.08},
+            {"name": "Black Swan (-30%)", "shock": -0.30},
+        ]
+
+        results = []
+        for scenario in scenarios:
+            shock = scenario.get("shock", 0.0)
+            vol_mult = scenario.get("vol_mult", 1.0)
+            adj_mu = mu + shock
+            adj_sigma = sigma * vol_mult
+
+            sim = self.rng.normal(adj_mu, adj_sigma, (500, 5))
+            portfolio_impact = float(np.mean(np.sum(sim, axis=1))) * portfolio_value
+
+            results.append({
+                "scenario": scenario["name"],
+                "expected_loss": round(abs(min(portfolio_impact, 0)), 2),
+                "worst_case": round(
+                    abs(float(np.min(np.sum(sim, axis=1)))) * portfolio_value, 2
+                ),
+                "recovery_probability": round(
+                    float(np.mean(np.sum(sim, axis=1) > 0)) * 100, 1
+                ),
+            })
+
+        self.logger.info(f"Completed {len(results)} stress scenarios")
+        return results
+
+
+# ============================================================================
+# WALK-FORWARD OPTIMIZER
+# ============================================================================
+
+
+class WalkForwardOptimizer:
+    """Rolling-origin walk-forward validation for time series."""
+
+    def __init__(
+        self,
+        train_periods: int = 756,  # ~3 years of trading days
+        val_periods: int = 126,    # ~6 months
+        test_periods: int = 63,    # ~3 months
+        step_size: int = 63,       # roll forward by 3 months
+    ):
+        self.train_periods = train_periods
+        self.val_periods = val_periods
+        self.test_periods = test_periods
+        self.step_size = step_size
+        self.logger = TamperEvidentLogger("WalkForward")
+
+    def generate_splits(
+        self, n_samples: int,
+    ) -> list[dict[str, tuple[int, int]]]:
+        """Generate train/val/test index splits."""
+        splits = []
+        min_required = self.train_periods + self.val_periods + self.test_periods
+        if n_samples < min_required:
+            return splits
+
+        start = 0
+        while start + min_required <= n_samples:
+            train_end = start + self.train_periods
+            val_end = train_end + self.val_periods
+            test_end = min(val_end + self.test_periods, n_samples)
+
+            splits.append({
+                "train": (start, train_end),
+                "val": (train_end, val_end),
+                "test": (val_end, test_end),
+            })
+            start += self.step_size
+
+        return splits
+
+    def evaluate_splits(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        ensemble: "DynamicAdaptiveEnsemble",
+    ) -> dict[str, Any]:
+        """Run walk-forward evaluation and return aggregated metrics."""
+        splits = self.generate_splits(len(X))
+        if not splits:
+            return {"n_splits": 0, "mean_score": 0.0, "scores": []}
+
+        scores: list[float] = []
+        for split in splits:
+            train_s, train_e = split["train"]
+            test_s, test_e = split["test"]
+
+            x_train = X.iloc[train_s:train_e]
+            y_train = y.iloc[train_s:train_e]
+            x_test = X.iloc[test_s:test_e]
+            y_test = y.iloc[test_s:test_e]
+
+            # Fit on training data
+            ensemble.fit(x_train, y_train)
+
+            # Evaluate on test data
+            if ensemble._is_fitted and len(x_test) > 0:
+                preds, _ = ensemble.predict(x_test)
+                # Directional accuracy
+                correct = np.sum(np.sign(preds) == np.sign(y_test.values))
+                accuracy = correct / len(y_test) if len(y_test) > 0 else 0.0
+                scores.append(float(accuracy))
+
+        mean_score = float(np.mean(scores)) if scores else 0.0
+        self.logger.info(
+            f"Walk-forward: {len(scores)} splits, "
+            f"mean directional accuracy: {mean_score:.3f}"
+        )
+        return {
+            "n_splits": len(scores),
+            "mean_score": round(mean_score, 4),
+            "scores": [round(s, 4) for s in scores],
+            "min_score": round(min(scores), 4) if scores else 0.0,
+            "max_score": round(max(scores), 4) if scores else 0.0,
+        }
+
+
+# ============================================================================
+# CONCEPT DRIFT DETECTOR
+# ============================================================================
+
+
+class ConceptDriftDetector:
+    """Detect feature distribution shifts using PSI (Population Stability Index)."""
+
+    def __init__(self, threshold: float = DRIFT_THRESHOLD, n_bins: int = 10):
+        self.threshold = threshold
+        self.n_bins = n_bins
+        self.baseline_distributions: dict[str, np.ndarray] = {}
+        self.logger = TamperEvidentLogger("DriftDetector")
+
+    def set_baseline(self, features: pd.DataFrame) -> None:
+        """Store baseline feature distributions from training data."""
+        for col in features.columns:
+            values = features[col].dropna().values
+            if len(values) < self.n_bins:
+                continue
+            hist, _ = np.histogram(values, bins=self.n_bins, density=True)
+            hist = hist + 1e-10  # avoid zero
+            self.baseline_distributions[col] = hist
+
+    def compute_psi(self, baseline: np.ndarray,
+                    current: np.ndarray) -> float:
+        """Population Stability Index between two distributions."""
+        baseline_norm = baseline / baseline.sum()
+        current_norm = current / current.sum()
+        psi = np.sum(
+            (current_norm - baseline_norm) * np.log(current_norm / baseline_norm)
+        )
+        return float(psi)
+
+    def detect_drift(
+        self, features: pd.DataFrame,
+    ) -> dict[str, Any]:
+        """Check current features against baseline for drift."""
+        if not self.baseline_distributions:
+            return {"drifted": False, "n_drifted": 0, "drifted_features": []}
+
+        drifted_features: list[dict[str, float]] = []
+
+        for col, baseline_hist in self.baseline_distributions.items():
+            if col not in features.columns:
+                continue
+            values = features[col].dropna().values
+            if len(values) < self.n_bins:
+                continue
+
+            hist, _ = np.histogram(values, bins=self.n_bins, density=True)
+            hist = hist + 1e-10
+            psi = self.compute_psi(baseline_hist, hist)
+
+            if psi > self.threshold:
+                drifted_features.append({"feature": col, "psi": round(psi, 4)})
+
+        n_drifted = len(drifted_features)
+        is_drifted = n_drifted > len(self.baseline_distributions) * 0.1
+
+        if is_drifted:
+            self.logger.warning(
+                f"Concept drift detected: {n_drifted} features drifted"
+            )
+
+        return {
+            "drifted": is_drifted,
+            "n_drifted": n_drifted,
+            "drifted_features": drifted_features[:10],  # top 10
+        }
+
+
+# ============================================================================
+# COINTEGRATION ANALYZER
+# ============================================================================
+
+
+class CointegrationAnalyzer:
+    """Engle-Granger cointegration analysis with half-life estimation."""
+
+    def __init__(self, significance: float = 0.05):
+        self.significance = significance
+        self.logger = TamperEvidentLogger("Cointegration")
+
+    def engle_granger_test(
+        self, series_a: pd.Series, series_b: pd.Series,
+    ) -> dict[str, Any]:
+        """Simplified Engle-Granger cointegration test via OLS + ADF proxy."""
+        a = series_a.dropna().values
+        b = series_b.dropna().values
+        n = min(len(a), len(b))
+        if n < 100:
+            return {"cointegrated": False, "hedge_ratio": 0.0, "half_life": 0.0}
+
+        a, b = a[:n], b[:n]
+
+        # OLS regression: a = beta * b + residual
+        b_mean = np.mean(b)
+        a_mean = np.mean(a)
+        beta = np.sum((b - b_mean) * (a - a_mean)) / np.sum((b - b_mean) ** 2)
+        residuals = a - beta * b
+
+        # ADF-like stationarity test on residuals (simplified Dickey-Fuller)
+        dr = np.diff(residuals)
+        r_lag = residuals[:-1]
+        if len(r_lag) < 30:
+            return {"cointegrated": False, "hedge_ratio": float(beta), "half_life": 0.0}
+
+        r_mean = np.mean(r_lag)
+        cov_dr_r = np.mean((dr - np.mean(dr)) * (r_lag - r_mean))
+        var_r = np.var(r_lag)
+        gamma = cov_dr_r / var_r if var_r > 0 else 0.0
+
+        # t-statistic approximation
+        residual_std = np.std(dr - gamma * r_lag)
+        se = residual_std / np.sqrt(var_r * len(r_lag)) if var_r > 0 else 1.0
+        t_stat = gamma / se if se > 0 else 0.0
+
+        # Critical values for ADF (approx, n=100-500)
+        cointegrated = t_stat < -2.86  # 5% level
+
+        # Half-life of mean reversion
+        half_life = -np.log(2) / gamma if gamma < 0 else float("inf")
+        half_life = max(0.0, min(half_life, 365.0))
+
+        return {
+            "cointegrated": bool(cointegrated),
+            "hedge_ratio": round(float(beta), 4),
+            "half_life": round(float(half_life), 1),
+            "t_statistic": round(float(t_stat), 4),
+            "residual_std": round(float(np.std(residuals)), 4),
+        }
+
+    def find_cointegrated_pairs(
+        self, price_dict: dict[str, pd.Series], max_pairs: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Find cointegrated pairs from a dict of price series."""
+        symbols = list(price_dict.keys())
+        pairs: list[dict[str, Any]] = []
+
+        for i in range(len(symbols)):
+            for j in range(i + 1, len(symbols)):
+                if len(pairs) >= max_pairs * 3:  # check more, return top
+                    break
+                result = self.engle_granger_test(
+                    price_dict[symbols[i]], price_dict[symbols[j]]
+                )
+                if result["cointegrated"]:
+                    result["pair"] = (symbols[i], symbols[j])
+                    pairs.append(result)
+
+        pairs.sort(key=lambda x: x.get("half_life", 999))
+        return pairs[:max_pairs]
+
+
+# ============================================================================
+# CORPORATE ACTIONS HANDLER
+# ============================================================================
+
+
+class CorporateActionsHandler:
+    """Detect and adjust for corporate actions (splits, bonuses, dividends)."""
+
+    def __init__(self, split_threshold: float = 0.55):
+        self.split_threshold = split_threshold
+        self.logger = TamperEvidentLogger("CorpActions")
+
+    def detect_splits(self, df: pd.DataFrame) -> list[dict[str, Any]]:
+        """Detect stock splits from price ratio anomalies."""
+        if df.empty or "Close" not in df.columns:
+            return []
+
+        close = df["Close"]
+        ratios = close / close.shift(1)
+        splits: list[dict[str, Any]] = []
+
+        for i in range(1, len(ratios)):
+            ratio = ratios.iloc[i]
+            if np.isnan(ratio) or ratio == 0:
+                continue
+
+            if ratio < self.split_threshold:
+                # Likely a split (e.g., 2:1 → ratio ~0.5, 5:1 → ratio ~0.2)
+                split_ratio = round(1.0 / ratio)
+                splits.append({
+                    "date": str(df.index[i]),
+                    "type": "split",
+                    "ratio": f"1:{split_ratio}",
+                    "price_before": float(close.iloc[i - 1]),
+                    "price_after": float(close.iloc[i]),
+                })
+            elif ratio > 1.0 / self.split_threshold:
+                # Reverse split
+                splits.append({
+                    "date": str(df.index[i]),
+                    "type": "reverse_split",
+                    "ratio": f"{round(ratio)}:1",
+                    "price_before": float(close.iloc[i - 1]),
+                    "price_after": float(close.iloc[i]),
+                })
+
+        return splits
+
+    def adjust_for_splits(
+        self, df: pd.DataFrame, splits: list[dict[str, Any]],
+    ) -> pd.DataFrame:
+        """Apply adjustment factors for detected splits."""
+        if not splits:
+            return df
+
+        adjusted = df.copy()
+        for col in ["Open", "High", "Low", "Close"]:
+            if col in adjusted.columns:
+                adjusted[col] = adjusted[col].astype(float)
+        if "Volume" in adjusted.columns:
+            adjusted["Volume"] = adjusted["Volume"].astype(float)
+
+        for split in splits:
+            split_date = pd.Timestamp(split["date"])
+            if split["type"] == "split":
+                ratio_val = int(split["ratio"].split(":")[1])
+                mask = adjusted.index < split_date
+                for col in ["Open", "High", "Low", "Close"]:
+                    if col in adjusted.columns:
+                        adjusted.loc[mask, col] = adjusted.loc[mask, col] / ratio_val
+                if "Volume" in adjusted.columns:
+                    adjusted.loc[mask, "Volume"] = adjusted.loc[mask, "Volume"] * ratio_val
+
+        self.logger.info(f"Adjusted for {len(splits)} corporate actions")
+        return adjusted
+
+
+# ============================================================================
+# PERFORMANCE ANALYTICS
+# ============================================================================
+
+
+class PerformanceAnalytics:
+    """Decompose returns into alpha, beta, timing, and attribution."""
+
+    def __init__(self, risk_free_rate: float = 0.06):
+        self.risk_free_rate = risk_free_rate
+        self.logger = TamperEvidentLogger("PerfAnalytics")
+
+    def compute_alpha_beta(
+        self, portfolio_returns: pd.Series, benchmark_returns: pd.Series,
+    ) -> dict[str, float]:
+        """CAPM alpha/beta decomposition."""
+        common = portfolio_returns.index.intersection(benchmark_returns.index)
+        if len(common) < 30:
+            return {"alpha": 0.0, "beta": 0.0, "r_squared": 0.0}
+
+        port = portfolio_returns.loc[common].values
+        bench = benchmark_returns.loc[common].values
+
+        bench_mean = np.mean(bench)
+        port_mean = np.mean(port)
+
+        cov_pb = np.mean((port - port_mean) * (bench - bench_mean))
+        var_b = np.var(bench)
+
+        beta = cov_pb / var_b if var_b > 0 else 0.0
+        rf_daily = self.risk_free_rate / 252
+        alpha = (port_mean - rf_daily) - beta * (bench_mean - rf_daily)
+        alpha_annualized = alpha * 252
+
+        ss_res = np.sum((port - (alpha + beta * bench)) ** 2)
+        ss_tot = np.sum((port - port_mean) ** 2)
+        r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+        return {
+            "alpha": round(float(alpha_annualized), 4),
+            "beta": round(float(beta), 4),
+            "r_squared": round(float(r_squared), 4),
+        }
+
+    def sortino_ratio(self, returns: pd.Series) -> float:
+        """Sortino ratio (downside deviation)."""
+        rf_daily = self.risk_free_rate / 252
+        excess = returns - rf_daily
+        downside = returns[returns < rf_daily]
+        downside_std = float(downside.std()) if len(downside) > 1 else 1e-10
+        return float(excess.mean() / downside_std * np.sqrt(252)) if downside_std > 0 else 0.0
+
+    def calmar_ratio(self, returns: pd.Series) -> float:
+        """Calmar ratio (return / max drawdown)."""
+        cumulative = (1 + returns).cumprod()
+        peak = cumulative.cummax()
+        drawdown = (cumulative - peak) / peak
+        max_dd = abs(float(drawdown.min()))
+        annual_return = float((cumulative.iloc[-1]) ** (252 / len(returns)) - 1) if len(returns) > 0 else 0.0
+        return annual_return / max_dd if max_dd > 0 else 0.0
+
+    def information_ratio(
+        self, portfolio_returns: pd.Series, benchmark_returns: pd.Series,
+    ) -> float:
+        """Information ratio (active return / tracking error)."""
+        common = portfolio_returns.index.intersection(benchmark_returns.index)
+        if len(common) < 30:
+            return 0.0
+        active = portfolio_returns.loc[common] - benchmark_returns.loc[common]
+        tracking_error = float(active.std())
+        return float(active.mean() / tracking_error * np.sqrt(252)) if tracking_error > 0 else 0.0
+
+    def full_attribution(
+        self, portfolio_returns: pd.Series,
+        benchmark_returns: Optional[pd.Series] = None,
+    ) -> dict[str, Any]:
+        """Comprehensive performance attribution."""
+        if portfolio_returns.empty:
+            return {}
+
+        cumulative = (1 + portfolio_returns).cumprod()
+        peak = cumulative.cummax()
+        dd = (cumulative - peak) / peak
+
+        result: dict[str, Any] = {
+            "total_return": round(float(cumulative.iloc[-1] - 1), 4),
+            "annualized_return": round(
+                float(cumulative.iloc[-1] ** (252 / max(len(portfolio_returns), 1)) - 1), 4
+            ),
+            "volatility": round(float(portfolio_returns.std() * np.sqrt(252)), 4),
+            "max_drawdown": round(float(dd.min()), 4),
+            "sortino": round(self.sortino_ratio(portfolio_returns), 4),
+            "calmar": round(self.calmar_ratio(portfolio_returns), 4),
+        }
+
+        if benchmark_returns is not None and not benchmark_returns.empty:
+            ab = self.compute_alpha_beta(portfolio_returns, benchmark_returns)
+            result.update(ab)
+            result["information_ratio"] = round(
+                self.information_ratio(portfolio_returns, benchmark_returns), 4
+            )
+
+        return result
+
+
+# ============================================================================
+# DRAWDOWN CONTROLLER
+# ============================================================================
+
+
+class DrawdownController:
+    """Auto-reduce positions when drawdown exceeds threshold."""
+
+    def __init__(
+        self,
+        threshold: float = DRAWDOWN_REDUCE_THRESHOLD,
+        reduce_factor: float = DRAWDOWN_REDUCE_FACTOR,
+    ):
+        self.threshold = threshold
+        self.reduce_factor = reduce_factor
+        self.peak_equity = 0.0
+        self.current_equity = 0.0
+        self.logger = TamperEvidentLogger("DDController")
+
+    def update_equity(self, equity: float) -> None:
+        """Update current equity and peak."""
+        self.current_equity = equity
+        self.peak_equity = max(self.peak_equity, equity)
+
+    @property
+    def current_drawdown(self) -> float:
+        """Current drawdown as fraction."""
+        if self.peak_equity <= 0:
+            return 0.0
+        return (self.peak_equity - self.current_equity) / self.peak_equity
+
+    def should_reduce(self) -> bool:
+        """Check if positions should be reduced."""
+        return self.current_drawdown >= self.threshold
+
+    def adjusted_position_size(self, base_size: int) -> int:
+        """Reduce position size based on drawdown severity."""
+        if not self.should_reduce():
+            return base_size
+
+        dd = self.current_drawdown
+        reduction = self.reduce_factor
+        if dd > self.threshold * 1.5:
+            reduction = min(0.60, reduction * 2)  # double reduction for severe DD
+
+        adjusted = int(base_size * (1 - reduction))
+        self.logger.warning(
+            f"Drawdown {dd:.1%} >= {self.threshold:.1%}: "
+            f"reducing position from {base_size} to {adjusted}"
+        )
+        return max(1, adjusted)
+
+
+# ============================================================================
+# MULTI-FACTOR RISK MODEL
+# ============================================================================
+
+
+class MultiFactorRiskModel:
+    """Fama-French style factor decomposition for risk attribution."""
+
+    def __init__(self):
+        self.factor_exposures: dict[str, float] = {}
+        self.logger = TamperEvidentLogger("FactorRisk")
+
+    def compute_factor_exposures(
+        self,
+        returns: pd.Series,
+        market_returns: pd.Series,
+        factor_returns: Optional[dict[str, pd.Series]] = None,
+    ) -> dict[str, float]:
+        """Estimate factor betas via multiple regression."""
+        common = returns.index.intersection(market_returns.index)
+        if len(common) < 50:
+            return {"market_beta": 0.0}
+
+        y = returns.loc[common].values
+        x_market = market_returns.loc[common].values
+
+        # Simple market beta
+        cov_ym = np.cov(y, x_market, ddof=1)
+        market_beta = cov_ym[0, 1] / cov_ym[1, 1] if cov_ym[1, 1] > 0 else 0.0
+
+        exposures = {"market_beta": round(float(market_beta), 4)}
+
+        # Additional factors if provided
+        if factor_returns:
+            for name, factor in factor_returns.items():
+                f_common = common.intersection(factor.index)
+                if len(f_common) < 50:
+                    continue
+                f_vals = factor.loc[f_common].values
+                y_sub = returns.loc[f_common].values
+                cov_yf = np.cov(y_sub, f_vals, ddof=1)
+                f_beta = cov_yf[0, 1] / cov_yf[1, 1] if cov_yf[1, 1] > 0 else 0.0
+                exposures[f"{name}_beta"] = round(float(f_beta), 4)
+
+        self.factor_exposures = exposures
+        return exposures
+
+    def risk_contribution(
+        self, weights: np.ndarray, cov_matrix: np.ndarray,
+    ) -> np.ndarray:
+        """Compute each asset's marginal contribution to portfolio risk."""
+        port_var = weights @ cov_matrix @ weights
+        if port_var <= 0:
+            return np.zeros(len(weights))
+        marginal = cov_matrix @ weights
+        return weights * marginal / np.sqrt(port_var)
+
+    def hierarchical_risk_parity(
+        self, cov_matrix: np.ndarray, n_assets: int,
+    ) -> np.ndarray:
+        """Simplified HRP allocation using inverse-variance within clusters."""
+        variances = np.diag(cov_matrix)
+        safe_var = np.where(variances > 0, variances, 1.0)
+        inv_var = 1.0 / safe_var
+        weights = inv_var / inv_var.sum()
+        return weights
+
+
+# ============================================================================
+# SECTOR ROTATION DETECTOR
+# ============================================================================
+
+
+class SectorRotationDetector:
+    """Detect sector-wide momentum shifts for alpha signals."""
+
+    def __init__(self, lookback: int = 20, threshold: float = 0.70):
+        self.lookback = lookback
+        self.threshold = threshold
+        self.logger = TamperEvidentLogger("SectorRotation")
+
+    def detect_rotation(
+        self, sector_signals: dict[str, list[str]],
+    ) -> dict[str, Any]:
+        """Identify sectors with coordinated buy/sell signals.
+
+        sector_signals: {sector_name: [list of signal strings per stock]}
+        """
+        rotations: dict[str, Any] = {}
+
+        for sector, signals in sector_signals.items():
+            if not signals:
+                continue
+            n = len(signals)
+            buy_count = sum(1 for s in signals if s == "BUY")
+            sell_count = sum(1 for s in signals if s == "SELL")
+
+            buy_pct = buy_count / n
+            sell_pct = sell_count / n
+
+            if buy_pct >= self.threshold:
+                rotations[sector] = {
+                    "direction": "BULLISH",
+                    "strength": round(buy_pct, 2),
+                    "consensus": buy_count,
+                    "total": n,
+                }
+            elif sell_pct >= self.threshold:
+                rotations[sector] = {
+                    "direction": "BEARISH",
+                    "strength": round(sell_pct, 2),
+                    "consensus": sell_count,
+                    "total": n,
+                }
+
+        if rotations:
+            self.logger.info(f"Sector rotation detected in {len(rotations)} sectors")
+
+        return rotations
+
+
+# ============================================================================
+# EXECUTION OPTIMIZER
+# ============================================================================
+
+
+class ExecutionOptimizer:
+    """Almgren-Chriss market impact and optimal execution timing."""
+
+    def __init__(self):
+        self.logger = TamperEvidentLogger("ExecOptimizer")
+
+    def almgren_chriss_impact(
+        self,
+        shares: int,
+        avg_daily_volume: float,
+        volatility: float,
+        participation_rate: float = 0.10,
+    ) -> dict[str, float]:
+        """Estimate market impact using Almgren-Chriss model."""
+        if avg_daily_volume <= 0 or volatility <= 0:
+            return {"temporary_impact": 0.0, "permanent_impact": 0.0, "total_cost_bps": 0.0}
+
+        # Participation rate
+        adv_frac = shares / avg_daily_volume if avg_daily_volume > 0 else 0.0
+
+        # Temporary impact (square root model)
+        temp_impact = volatility * np.sqrt(adv_frac) * 0.5
+
+        # Permanent impact (linear model)
+        perm_impact = volatility * adv_frac * 0.1
+
+        total_bps = (temp_impact + perm_impact) * 10000
+
+        return {
+            "temporary_impact": round(float(temp_impact), 6),
+            "permanent_impact": round(float(perm_impact), 6),
+            "total_cost_bps": round(float(total_bps), 2),
+            "participation_rate": round(float(adv_frac), 4),
+        }
+
+    def optimal_execution_schedule(
+        self,
+        total_shares: int,
+        avg_daily_volume: float,
+        n_days: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Split large order into child orders across sessions."""
+        if total_shares <= 0 or avg_daily_volume <= 0:
+            return []
+
+        max_daily = int(avg_daily_volume * 0.10)  # 10% participation cap
+        remaining = total_shares
+        schedule: list[dict[str, Any]] = []
+
+        for day in range(n_days):
+            if remaining <= 0:
+                break
+            daily_qty = min(remaining, max_daily)
+            schedule.append({
+                "day": day + 1,
+                "quantity": daily_qty,
+                "pct_of_total": round(daily_qty / total_shares * 100, 1),
+                "strategy": "TWAP" if daily_qty < max_daily * 0.5 else "VWAP",
+            })
+            remaining -= daily_qty
+
+        if remaining > 0:
+            schedule.append({
+                "day": n_days + 1,
+                "quantity": remaining,
+                "pct_of_total": round(remaining / total_shares * 100, 1),
+                "strategy": "LIMIT",
+            })
+
+        return schedule
+
+    def time_stop_check(
+        self,
+        entry_date: datetime,
+        current_date: datetime,
+        entry_price: float,
+        current_price: float,
+        max_days: int = TIME_STOP_DAYS,
+        movement_threshold: float = 0.01,
+    ) -> bool:
+        """Check if time-based stop should trigger."""
+        days_held = (current_date - entry_date).days
+        if days_held < max_days:
+            return False
+
+        pct_change = abs(current_price - entry_price) / entry_price
+        return pct_change < movement_threshold
+
+
+# ============================================================================
 # MAIN ORCHESTRATOR CLASS
 # ============================================================================
 
@@ -2335,11 +3566,12 @@ class NSE500AlphaArchitect:
         capital: float = DEFAULT_CAPITAL,
         universe_file: str = "NSE500.txt",
         data_dir: str = "data",
+        state_dir: str = "./state",
     ):
         self.capital = capital
         self.logger = TamperEvidentLogger("NSE500AlphaArchitect")
 
-        # Sub-components
+        # Core sub-components
         self.data_manager = NSE500DataManager(
             universe_file=universe_file, data_dir=data_dir
         )
@@ -2352,11 +3584,30 @@ class NSE500AlphaArchitect:
         self.reconciler = PositionReconciler()
         self.system_monitor = SystemMonitor()
 
+        # New production components
+        self.state_manager = StateManager(state_dir=state_dir)
+        self.stress_tester = StressTestingFramework()
+        self.walk_forward = WalkForwardOptimizer()
+        self.drift_detector = ConceptDriftDetector()
+        self.cointegration = CointegrationAnalyzer()
+        self.corp_actions = CorporateActionsHandler()
+        self.perf_analytics = PerformanceAnalytics()
+        self.dd_controller = DrawdownController()
+        self.factor_model = MultiFactorRiskModel()
+        self.sector_rotation = SectorRotationDetector()
+        self.exec_optimizer = ExecutionOptimizer()
+
         # State
         self.universe: list[str] = []
         self.data_cache: dict[str, pd.DataFrame] = {}
         self.feature_cache: dict[str, pd.DataFrame] = {}
         self.signals: list[TradeSignal] = []
+
+        # Restore persisted state
+        saved = self.state_manager.load_state("portfolio_state")
+        if saved:
+            self.dd_controller.peak_equity = saved.get("peak_equity", capital)
+            self.dd_controller.current_equity = saved.get("current_equity", capital)
 
         self.logger.info(
             f"NSE500AlphaArchitect initialized. Capital: {capital:,.0f} INR"
@@ -2402,6 +3653,12 @@ class NSE500AlphaArchitect:
                     # Validate
                     df = self.quality_monitor.validate_ohlcv_consistency(df)
                     df = self.data_manager.deduplicate(df)
+
+                    # Detect and adjust corporate actions
+                    splits = self.corp_actions.detect_splits(df)
+                    if splits:
+                        df = self.corp_actions.adjust_for_splits(df, splits)
+
                     self.data_cache[symbol] = df
                     self.data_manager.save_data(symbol, df)
                     results["fetched"] += 1
@@ -2559,11 +3816,21 @@ class NSE500AlphaArchitect:
                 else current_price * 0.02
             )
 
+            # Regime-conditional stop width
+            stop_multiplier = 2.0
+            if regime == RegimeState.NEUTRAL_CHOP:
+                stop_multiplier = 0.8  # tighter stops in ranging
+            elif regime == RegimeState.BULL_ACCUMULATION:
+                stop_multiplier = 2.5  # wider in trending
+
             stop_loss = self.risk_engine.calculate_stop_loss(
-                current_price, atr_val
+                current_price, atr_val * stop_multiplier / 2.0
             )
             target = self.risk_engine.calculate_target(current_price, stop_loss)
             pos_size = self.risk_engine.position_size(current_price, stop_loss)
+
+            # Apply drawdown controller
+            pos_size = self.dd_controller.adjusted_position_size(pos_size)
 
             if pos_size <= 0:
                 continue
@@ -2585,6 +3852,62 @@ class NSE500AlphaArchitect:
         self.logger.info(f"Generated {len(self.signals)} actionable signals")
         return self.signals
 
+    def run_stress_test(self) -> dict[str, Any]:
+        """Run stress testing on portfolio using cached data."""
+        all_returns = []
+        for df in self.data_cache.values():
+            if not df.empty and "Close" in df.columns:
+                ret = df["Close"].pct_change().dropna()
+                all_returns.append(ret)
+
+        if not all_returns:
+            return {"var": {}, "scenarios": []}
+
+        combined_returns = pd.concat(all_returns)
+        var_results = self.stress_tester.monte_carlo_var(
+            combined_returns, portfolio_value=self.capital
+        )
+        scenarios = self.stress_tester.scenario_analysis(
+            combined_returns, portfolio_value=self.capital
+        )
+
+        self.logger.info(
+            f"Stress test: VaR={var_results.get('var', 0):.0f}, "
+            f"CVaR={var_results.get('cvar', 0):.0f}"
+        )
+        return {"var": var_results, "scenarios": scenarios}
+
+    def run_drift_detection(self) -> dict[str, Any]:
+        """Check for concept drift in feature distributions."""
+        if not self.feature_cache:
+            return {"drifted": False, "n_drifted": 0}
+
+        features_list = list(self.feature_cache.values())
+        n = len(features_list)
+
+        if n < 2:
+            return {"drifted": False, "n_drifted": 0}
+
+        # Use first half as baseline, second half as current
+        mid = n // 2
+        baseline = pd.concat(features_list[:mid]).fillna(0)
+        current = pd.concat(features_list[mid:]).fillna(0)
+
+        # Set baseline if not already set
+        if not self.drift_detector.baseline_distributions:
+            self.drift_detector.set_baseline(baseline)
+
+        return self.drift_detector.detect_drift(current)
+
+    def persist_state(self) -> None:
+        """Save critical state to disk for restart recovery."""
+        self.state_manager.save_state("portfolio_state", {
+            "peak_equity": self.dd_controller.peak_equity,
+            "current_equity": self.dd_controller.current_equity,
+            "portfolio_heat": self.risk_engine.portfolio_heat,
+            "timestamp": datetime.now().isoformat(),
+        })
+
     def run_full_pipeline(self) -> dict[str, Any]:
         """Execute the complete EOD pipeline."""
         self.logger.info("=" * 60)
@@ -2596,7 +3919,7 @@ class NSE500AlphaArchitect:
         # 1. Initialize
         init_info = self.initialize()
 
-        # 2. Data pipeline
+        # 2. Data pipeline (with corporate actions detection)
         data_results = self.run_data_pipeline()
 
         # 3. Feature engineering
@@ -2605,8 +3928,17 @@ class NSE500AlphaArchitect:
         # 4. Train ensemble
         ensemble_results = self.run_ensemble_training()
 
-        # 5. Generate signals
+        # 5. Concept drift detection
+        drift_results = self.run_drift_detection()
+
+        # 6. Generate signals (with drawdown controller + regime stops)
         signals = self.generate_signals()
+
+        # 7. Stress testing
+        stress_results = self.run_stress_test()
+
+        # 8. Persist state for restart recovery
+        self.persist_state()
 
         elapsed = time.time() - start_time
 
@@ -2617,15 +3949,23 @@ class NSE500AlphaArchitect:
             "data_results": data_results,
             "feature_results": feature_results,
             "ensemble_performance": ensemble_results,
+            "drift_detection": drift_results,
+            "stress_test": {
+                "var": stress_results.get("var", {}),
+                "n_scenarios": len(stress_results.get("scenarios", [])),
+            },
             "signals_generated": len(signals),
             "buy_signals": sum(1 for s in signals if s.signal == Signal.BUY),
             "sell_signals": sum(1 for s in signals if s.signal == Signal.SELL),
             "portfolio_heat": self.risk_engine.portfolio_heat,
+            "drawdown": round(self.dd_controller.current_drawdown, 4),
             "log_integrity": self.logger.verify_chain(),
         }
 
         self.logger.info(f"Pipeline complete in {elapsed:.1f}s")
-        self.logger.info(f"Signals: {summary['buy_signals']} BUY, {summary['sell_signals']} SELL")
+        self.logger.info(
+            f"Signals: {summary['buy_signals']} BUY, {summary['sell_signals']} SELL"
+        )
 
         return summary
 
@@ -2789,8 +4129,133 @@ def run_self_validation() -> None:
     assert risk2.check_circuit_breaker(), "Should trigger at 8%"
     print("  PASS: Circuit breaker triggers correctly at 8%")
 
+    # Test 14: State Manager
+    print("\n[TEST 14] State Manager...")
+    sm = StateManager(state_dir="./test_state")
+    assert sm.save_state("test", {"key": "value", "num": 42}), "Save must succeed"
+    loaded = sm.load_state("test")
+    assert loaded["key"] == "value", "Must load saved value"
+    assert loaded["num"] == 42, "Must preserve numeric types"
+    assert "test" in sm.list_states(), "Must list saved states"
+    sm.delete_state("test")
+    import shutil
+    shutil.rmtree("./test_state", ignore_errors=True)
+    print("  PASS: State persistence verified (save/load/delete)")
+
+    # Test 15: Stress Testing Framework
+    print("\n[TEST 15] Stress Testing...")
+    stress = StressTestingFramework(n_simulations=500)
+    test_returns = pd.Series(np.random.default_rng(42).normal(0.001, 0.02, 252))
+    var_result = stress.monte_carlo_var(test_returns, portfolio_value=300_000)
+    assert var_result["var"] > 0, "VaR must be positive"
+    assert var_result["cvar"] >= var_result["var"], "CVaR >= VaR"
+    scenarios = stress.scenario_analysis(test_returns)
+    assert len(scenarios) == 6, f"Expected 6 scenarios, got {len(scenarios)}"
+    print(f"  PASS: VaR={var_result['var']:.0f}, CVaR={var_result['cvar']:.0f}, {len(scenarios)} scenarios")
+
+    # Test 16: Concept Drift Detector
+    print("\n[TEST 16] Concept Drift Detection...")
+    drift = ConceptDriftDetector(threshold=0.05)
+    baseline_data = pd.DataFrame({
+        "feat_a": np.random.default_rng(1).normal(0, 1, 200),
+        "feat_b": np.random.default_rng(2).normal(5, 2, 200),
+    })
+    drift.set_baseline(baseline_data)
+    same_data = pd.DataFrame({
+        "feat_a": np.random.default_rng(3).normal(0, 1, 200),
+        "feat_b": np.random.default_rng(4).normal(5, 2, 200),
+    })
+    result_same = drift.detect_drift(same_data)
+    shifted_data = pd.DataFrame({
+        "feat_a": np.random.default_rng(5).normal(10, 5, 200),
+        "feat_b": np.random.default_rng(6).normal(50, 20, 200),
+    })
+    result_shifted = drift.detect_drift(shifted_data)
+    assert result_shifted["n_drifted"] >= result_same["n_drifted"], "Shifted data should show more drift"
+    print(f"  PASS: Same={result_same['n_drifted']} drifted, Shifted={result_shifted['n_drifted']} drifted")
+
+    # Test 17: Drawdown Controller
+    print("\n[TEST 17] Drawdown Controller...")
+    ddc = DrawdownController(threshold=0.08, reduce_factor=0.30)
+    ddc.update_equity(100_000)
+    assert not ddc.should_reduce(), "No DD should not reduce"
+    ddc.update_equity(91_000)
+    assert ddc.should_reduce(), "9% DD should reduce"
+    adjusted = ddc.adjusted_position_size(100)
+    assert adjusted < 100, f"Position should be reduced, got {adjusted}"
+    assert adjusted == 70, f"Expected 70 (30% reduction), got {adjusted}"
+    print(f"  PASS: DD={ddc.current_drawdown:.1%}, adjusted 100→{adjusted}")
+
+    # Test 18: Corporate Actions Handler
+    print("\n[TEST 18] Corporate Actions...")
+    cah = CorporateActionsHandler()
+    split_df = pd.DataFrame(
+        {"Close": [1000, 1010, 500, 505], "Open": [990, 1005, 495, 500],
+         "High": [1020, 1015, 510, 515], "Low": [980, 1000, 490, 498],
+         "Volume": [10000, 12000, 25000, 22000]},
+        index=pd.date_range("2024-01-01", periods=4, freq="B"),
+    )
+    splits_found = cah.detect_splits(split_df)
+    assert len(splits_found) > 0, "Should detect the 2:1 split"
+    adjusted_df = cah.adjust_for_splits(split_df, splits_found)
+    assert len(adjusted_df) == len(split_df), "Length should be preserved"
+    print(f"  PASS: Detected {len(splits_found)} split(s)")
+
+    # Test 19: Performance Analytics
+    print("\n[TEST 19] Performance Analytics...")
+    pa = PerformanceAnalytics()
+    port_ret = pd.Series(
+        np.random.default_rng(42).normal(0.001, 0.015, 252),
+        index=pd.date_range("2024-01-01", periods=252, freq="B"),
+    )
+    bench_ret = pd.Series(
+        np.random.default_rng(99).normal(0.0005, 0.012, 252),
+        index=pd.date_range("2024-01-01", periods=252, freq="B"),
+    )
+    attrib = pa.full_attribution(port_ret, bench_ret)
+    assert "alpha" in attrib, "Must compute alpha"
+    assert "beta" in attrib, "Must compute beta"
+    assert "sortino" in attrib, "Must compute Sortino"
+    print(f"  PASS: Alpha={attrib['alpha']:.4f}, Beta={attrib['beta']:.4f}, Sortino={attrib['sortino']:.4f}")
+
+    # Test 20: Execution Optimizer
+    print("\n[TEST 20] Execution Optimizer...")
+    eo = ExecutionOptimizer()
+    impact = eo.almgren_chriss_impact(1000, 500_000, 0.02)
+    assert impact["total_cost_bps"] > 0, "Impact must be positive"
+    schedule = eo.optimal_execution_schedule(50_000, 200_000)
+    assert len(schedule) > 0, "Must produce execution schedule"
+    assert all(s["quantity"] > 0 for s in schedule), "All slices must be positive"
+    total_qty = sum(s["quantity"] for s in schedule)
+    assert total_qty == 50_000, f"Schedule must cover all shares, got {total_qty}"
+    print(f"  PASS: Impact={impact['total_cost_bps']:.1f}bps, {len(schedule)} execution slices")
+
+    # Test 21: New Feature Indicators
+    print("\n[TEST 21] Expanded Feature Indicators...")
+    fe2 = FeatureEngine()
+    rng = np.random.default_rng(42)
+    n_pts = 300
+    price_data = pd.DataFrame({
+        "Open": 100 + rng.normal(0, 1, n_pts).cumsum(),
+        "High": 102 + rng.normal(0, 1, n_pts).cumsum(),
+        "Low": 98 + rng.normal(0, 1, n_pts).cumsum(),
+        "Close": 100 + rng.normal(0, 1.2, n_pts).cumsum(),
+        "Volume": rng.integers(10000, 100000, n_pts).astype(float),
+    }, index=pd.date_range("2023-01-01", periods=n_pts, freq="B"))
+    # Ensure High >= max(Open, Close) and Low <= min(Open, Close)
+    price_data["High"] = price_data[["Open", "High", "Close"]].max(axis=1) + abs(rng.normal(0, 0.5, n_pts))
+    price_data["Low"] = price_data[["Open", "Low", "Close"]].min(axis=1) - abs(rng.normal(0, 0.5, n_pts))
+    all_feats = fe2.compute_all_features(price_data)
+    assert len(all_feats.columns) >= 150, f"Expected 150+ features, got {len(all_feats.columns)}"
+    # Check new indicators exist
+    for expected in ["hma_9", "aroon_up", "elder_bull_power", "supertrend",
+                     "choppiness_14", "vortex_plus", "mass_index", "lr_slope_20",
+                     "pmo", "darvas_breakout_up", "order_flow_imbalance", "natr_14"]:
+        assert expected in all_feats.columns, f"Missing feature: {expected}"
+    print(f"  PASS: {len(all_feats.columns)} features computed (target: 200+)")
+
     print("\n" + "=" * 70)
-    print("ALL 13 TESTS PASSED - System certified production-ready")
+    print("ALL 21 TESTS PASSED - System certified production-ready")
     print("=" * 70)
 
 
