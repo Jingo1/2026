@@ -1,0 +1,40 @@
+[project]
+name = "nse500-swing-alpha"
+version = "1.0.0"
+description = "Production-grade EOD swing trading signal generation platform for NSE500"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.26.0",
+    "pandas>=2.1.0",
+    "pyarrow>=14.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.1.0",
+]
+full = [
+    "yfinance>=0.2.30",
+    "psutil>=5.9.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.coverage.run]
+source = ["nse500_swing_alpha"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 70
